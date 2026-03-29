@@ -135,6 +135,24 @@ copy_core_files() {
     cp "$CEOLOOP_HOME/core/skills/boot/SKILL.md" "$claude_dir/skills/boot/SKILL.md" 2>/dev/null || true
   fi
 
+  # Ensure approvals directory exists
+  mkdir -p "$claude_dir/approvals"/{pending,approved,rejected}
+
+  # Sync settings.json — merge template permissions into existing settings
+  local template_settings="$CEOLOOP_HOME/templates/claude-settings/settings.json"
+  local project_settings="$claude_dir/settings.json"
+  if [ -f "$template_settings" ]; then
+    if [ -f "$project_settings" ]; then
+      # Merge: overwrite permissions and hooks from template, preserve custom fields
+      local tmp
+      tmp=$(mktemp)
+      jq -s '.[1] * {permissions: .[0].permissions, hooks: .[0].hooks, env: .[0].env}' \
+        "$template_settings" "$project_settings" > "$tmp" 2>/dev/null && mv "$tmp" "$project_settings"
+    else
+      cp "$template_settings" "$project_settings"
+    fi
+  fi
+
   # Pre-create Claude Code memory directory to avoid interactive prompts
   local project_path_encoded
   project_path_encoded="$(echo "$target_dir" | sed 's|/|-|g')"
@@ -303,7 +321,7 @@ cmd_init() {
   info "Scaffolding .claude/ structure..."
 
   local claude_dir="$(pwd)/.claude"
-  mkdir -p "$claude_dir"/{telegram,agents,hooks,scripts,skills/boot,logs}
+  mkdir -p "$claude_dir"/{telegram,agents,hooks,scripts,skills/boot,logs,approvals/{pending,approved,rejected}}
 
   # ceoloop.json
   local version

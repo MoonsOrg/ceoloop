@@ -39,6 +39,10 @@
           {
             "type": "command",
             "command": ".claude/hooks/block-ceo-bash.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/approval-gate.sh"
           }
         ]
       },

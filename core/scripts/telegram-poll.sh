@@ -87,7 +87,10 @@ trim_dedup_file() {
   fi
 }
 
-# --- Secure API call helper ---
+# --- Approvals directory ---
+APPROVALS_DIR="$PROJECT_DIR/.claude/approvals"
+
+# --- Secure API call helper (GET) ---
 api_call() {
   local endpoint="$1"
   local curl_conf
@@ -98,6 +101,117 @@ api_call() {
   result=$(curl -s -K "$curl_conf" 2>/dev/null) || result=""
   rm -f "$curl_conf"
   echo "$result"
+}
+
+# --- Secure API call helper (POST JSON) ---
+api_post() {
+  local endpoint="$1"
+  local data="$2"
+  local curl_conf
+  curl_conf=$(mktemp)
+  echo "url = https://api.telegram.org/bot${TOKEN}/${endpoint}" > "$curl_conf"
+  chmod 600 "$curl_conf"
+  local result
+  result=$(echo "$data" | curl -s -X POST -K "$curl_conf" -H "Content-Type: application/json" -d @- 2>/dev/null) || result=""
+  rm -f "$curl_conf"
+  echo "$result"
+}
+
+# --- Handle approval callback queries (button clicks) ---
+handle_callback() {
+  local callback_id="$1"
+  local callback_data="$2"
+  local chat_id="$3"
+  local message_id="$4"
+
+  local action request_id
+  action=$(echo "$callback_data" | cut -d: -f1)
+  request_id=$(echo "$callback_data" | cut -d: -f2)
+
+  local pending_file="$APPROVALS_DIR/pending/$request_id.json"
+
+  case "$action" in
+    approve)
+      if [ -f "$pending_file" ]; then
+        mkdir -p "$APPROVALS_DIR/approved"
+        local cmd
+        cmd=$(jq -r '.command' "$pending_file")
+        jq '.status = "approved"' "$pending_file" > "$APPROVALS_DIR/approved/$request_id.json"
+        rm -f "$pending_file"
+
+        # Edit the original message to show result
+        api_post "editMessageText" "$(jq -n \
+          --arg chat_id "$chat_id" \
+          --argjson message_id "$message_id" \
+          --arg text "$(printf "Approved\n\n%s" "$cmd")" \
+          '{chat_id: $chat_id, message_id: $message_id, text: $text}')" >/dev/null 2>&1
+
+        # Drop a message in inbox so CEO knows to retry
+        jq -n \
+          --arg request_id "$request_id" \
+          --arg command "$cmd" \
+          --arg received_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '{type: "approval_response", action: "approved", request_id: $request_id,
+            command: $command, text: "Founder approved this command. Re-assign to the responsible agent.",
+            received_at: $received_at, source: "approval-gate"}' \
+          > "$INBOX_DIR/approval_${request_id}.json" 2>/dev/null
+      fi
+      api_post "answerCallbackQuery" "$(jq -n \
+        --arg id "$callback_id" --arg text "Approved" \
+        '{callback_query_id: $id, text: $text}')" >/dev/null 2>&1
+      ;;
+
+    reject)
+      if [ -f "$pending_file" ]; then
+        mkdir -p "$APPROVALS_DIR/rejected"
+        local cmd
+        cmd=$(jq -r '.command' "$pending_file")
+        jq '.status = "rejected"' "$pending_file" > "$APPROVALS_DIR/rejected/$request_id.json"
+        rm -f "$pending_file"
+
+        api_post "editMessageText" "$(jq -n \
+          --arg chat_id "$chat_id" \
+          --argjson message_id "$message_id" \
+          --arg text "$(printf "Rejected\n\n%s" "$cmd")" \
+          '{chat_id: $chat_id, message_id: $message_id, text: $text}')" >/dev/null 2>&1
+
+        jq -n \
+          --arg request_id "$request_id" \
+          --arg command "$cmd" \
+          --arg received_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '{type: "approval_response", action: "rejected", request_id: $request_id,
+            command: $command, text: "Founder rejected this command. Do not retry.",
+            received_at: $received_at, source: "approval-gate"}' \
+          > "$INBOX_DIR/approval_${request_id}.json" 2>/dev/null
+      fi
+      api_post "answerCallbackQuery" "$(jq -n \
+        --arg id "$callback_id" --arg text "Rejected" \
+        '{callback_query_id: $id, text: $text}')" >/dev/null 2>&1
+      ;;
+
+    details)
+      if [ -f "$pending_file" ]; then
+        local full_cmd desc ts tool
+        full_cmd=$(jq -r '.command' "$pending_file")
+        desc=$(jq -r '.description // "None"' "$pending_file")
+        ts=$(jq -r '.timestamp // "Unknown"' "$pending_file")
+        tool=$(jq -r '.tool // "Bash"' "$pending_file")
+
+        local details_text
+        details_text=$(printf "Request Details\n\nID: %s\nTool: %s\nTime: %s\nReason: %s\n\nFull command:\n%s" \
+          "$request_id" "$tool" "$ts" "$desc" "$full_cmd")
+
+        # Send as a new message (keep the buttons on the original)
+        api_post "sendMessage" "$(jq -n \
+          --arg chat_id "$chat_id" \
+          --arg text "$details_text" \
+          '{chat_id: $chat_id, text: $text}')" >/dev/null 2>&1
+      fi
+      api_post "answerCallbackQuery" "$(jq -n \
+        --arg id "$callback_id" \
+        '{callback_query_id: $id}')" >/dev/null 2>&1
+      ;;
+  esac
 }
 
 # --- Fetch 1: Recent history (last 20 messages, ignoring offset) ---
@@ -123,14 +237,28 @@ while read -r update; do
   [ -z "$update" ] && continue
 
   UPDATE_ID=$(echo "$update" | jq -r '.update_id')
-  USER_ID=$(echo "$update" | jq -r '.message.from.id // empty')
-  MSG_ID=$(echo "$update" | jq -r '.message.message_id // empty')
 
   # Advance offset past this update
   NEXT_OFFSET=$((UPDATE_ID + 1))
   CURRENT_OFFSET=0
   [ -f "$OFFSET_FILE" ] && CURRENT_OFFSET=$(cat "$OFFSET_FILE")
   [ "$NEXT_OFFSET" -gt "$CURRENT_OFFSET" ] && echo "$NEXT_OFFSET" > "$OFFSET_FILE"
+
+  # --- Handle callback queries (approval button clicks) ---
+  CALLBACK_DATA=$(echo "$update" | jq -r '.callback_query.data // empty')
+  if [ -n "$CALLBACK_DATA" ]; then
+    CB_ID=$(echo "$update" | jq -r '.callback_query.id')
+    CB_USER=$(echo "$update" | jq -r '.callback_query.from.id // empty')
+    CB_CHAT=$(echo "$update" | jq -r '.callback_query.message.chat.id // empty')
+    CB_MSG=$(echo "$update" | jq -r '.callback_query.message.message_id // empty')
+    # Security: only process from allowed user
+    [ "$CB_USER" = "$ALLOWED_USER_ID" ] && handle_callback "$CB_ID" "$CALLBACK_DATA" "$CB_CHAT" "$CB_MSG"
+    continue
+  fi
+
+  # --- Handle regular messages ---
+  USER_ID=$(echo "$update" | jq -r '.message.from.id // empty')
+  MSG_ID=$(echo "$update" | jq -r '.message.message_id // empty')
 
   # Security: only process messages from allowlisted users
   [ "$USER_ID" != "$ALLOWED_USER_ID" ] && continue
