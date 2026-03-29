@@ -3,10 +3,20 @@
   "permissions": {
     "defaultMode": "bypassPermissions",
     "allow": [
-      "Bash(cat .claude/telegram/*)",
-      "Read(.claude/telegram/*)",
-      "Write(.claude/telegram/*)",
-      "Edit(.claude/telegram/*)"
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Bash",
+      "Agent",
+      "WebFetch",
+      "WebSearch",
+      "SendMessage",
+      "TaskCreate",
+      "TaskUpdate",
+      "TaskGet",
+      "TaskList"
     ],
     "deny": [
       "Bash(rm -rf /)",
