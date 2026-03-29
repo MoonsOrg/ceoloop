@@ -134,6 +134,15 @@ copy_core_files() {
     mkdir -p "$claude_dir/skills/boot"
     cp "$CEOLOOP_HOME/core/skills/boot/SKILL.md" "$claude_dir/skills/boot/SKILL.md" 2>/dev/null || true
   fi
+
+  # Pre-create Claude Code memory directory to avoid interactive prompts
+  local project_path_encoded
+  project_path_encoded="$(echo "$target_dir" | sed 's|/|-|g')"
+  local memory_dir="$HOME/.claude/projects/${project_path_encoded}/memory"
+  mkdir -p "$memory_dir"
+  if [ ! -f "$memory_dir/MEMORY.md" ]; then
+    echo "# Memory Index" > "$memory_dir/MEMORY.md"
+  fi
 }
 
 # ============================================================================
