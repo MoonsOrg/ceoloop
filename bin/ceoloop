@@ -435,11 +435,8 @@ cmd_start() {
     fi
   done
 
-  # Kill orphan processes from old architecture
-  pkill -f 'claude.*plugin:telegram' 2>/dev/null || true
-  pkill -f 'bun.*telegram' 2>/dev/null || true
-
-  # Kill orphan telegram-daemon processes for THIS project
+  # Kill orphan processes for THIS project only
+  pkill -f "claude.*plugin:telegram.*${PROJECT_NAME}" 2>/dev/null || true
   pkill -f "telegram-daemon.sh.*${PROJECT_NAME}" 2>/dev/null || true
 
   # Brief pause to release polling locks
@@ -562,10 +559,9 @@ cmd_stop() {
     info "session '$SESSION' was not running"
   fi
 
-  # Kill orphan processes
-  pkill -f "claude.*plugin:telegram" 2>/dev/null || true
-  pkill -f "bun.*telegram" 2>/dev/null || true
-  pkill -f "telegram-daemon.sh" 2>/dev/null || true
+  # Kill orphan processes for THIS project only
+  pkill -f "claude.*plugin:telegram.*${PROJECT_NAME}" 2>/dev/null || true
+  pkill -f "telegram-daemon.sh.*${PROJECT_NAME}" 2>/dev/null || true
 
   # Clean PID file
   local pid_file="$(pwd)/.claude/telegram/daemon.pid"
