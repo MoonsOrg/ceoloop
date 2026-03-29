@@ -1,0 +1,848 @@
+#!/bin/bash
+# ============================================================================
+# CEOLoop CLI — main entry point
+#
+# Global install at ~/.ceoloop/bin/ceoloop, symlinked to ~/.local/bin/ceoloop.
+# Per-project config at .claude/ceoloop.json.
+#
+# Usage:
+#   ceoloop init        — interactive setup wizard
+#   ceoloop start       — launch tmux session (daemon + CEO)
+#   ceoloop stop        — kill tmux session + orphan processes
+#   ceoloop status      — check what's running
+#   ceoloop restart     — stop + start
+#   ceoloop install     — install macOS LaunchAgent for auto-start
+#   ceoloop uninstall   — remove LaunchAgent
+#   ceoloop update      — git pull + re-copy core files to current project
+#   ceoloop update --all — update all registered projects
+#   ceoloop version     — print version
+# ============================================================================
+set -euo pipefail
+
+# --- Constants ---
+CEOLOOP_HOME="${CEOLOOP_HOME:-$HOME/.ceoloop}"
+VERSION_FILE="$CEOLOOP_HOME/VERSION"
+REGISTRY_FILE="$CEOLOOP_HOME/registry.json"
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+ok()      { echo -e "  ${GREEN}ok${NC} $*"; }
+warn()    { echo -e "  ${YELLOW}WARNING${NC} $*"; }
+err()     { echo -e "  ${RED}ERROR${NC} $*" >&2; }
+info()    { echo "  $*"; }
+
+# --- Find binaries ---
+find_tmux() {
+  local t=""
+  for candidate in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    [ -x "$candidate" ] && t="$candidate" && break
+  done
+  command -v tmux >/dev/null 2>&1 && t="$(command -v tmux)"
+  echo "$t"
+}
+
+find_claude() {
+  local c=""
+  for candidate in /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.local/bin/claude"; do
+    [ -x "$candidate" ] && c="$candidate" && break
+  done
+  command -v claude >/dev/null 2>&1 && c="$(command -v claude)"
+  echo "$c"
+}
+
+# --- Project config ---
+# Reads .claude/ceoloop.json from the current directory
+load_project_config() {
+  local config_file="$(pwd)/.claude/ceoloop.json"
+  if [ ! -f "$config_file" ]; then
+    err "No .claude/ceoloop.json found in $(pwd)"
+    err "Run 'ceoloop init' first."
+    exit 1
+  fi
+  PROJECT_NAME="$(jq -r '.project' "$config_file")"
+  FOUNDER_CHAT_ID="$(jq -r '.founder_chat_id' "$config_file")"
+  LOGS_DIR="$(jq -r '.logs_dir // ".claude/logs"' "$config_file")"
+  SESSION="${PROJECT_NAME}-ceo"
+  DEBUG_LOG="/tmp/${PROJECT_NAME}-ceo-debug.log"
+  LAUNCHD_LABEL="com.ceoloop.${PROJECT_NAME}"
+}
+
+# --- Build PATH with common tool locations ---
+build_agent_path() {
+  local agent_path="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+  # Add nvm node if available
+  local node_dir=""
+  node_dir="$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | tail -1)" || true
+  [ -n "$node_dir" ] && agent_path="$HOME/.nvm/versions/node/$node_dir/bin:$agent_path"
+  echo "$agent_path"
+}
+
+# --- Register project in ~/.ceoloop/registry.json ---
+register_project() {
+  local project_name="$1"
+  local project_path="$2"
+
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    echo '{"projects":[]}' > "$REGISTRY_FILE"
+  fi
+
+  # Check if already registered
+  local exists
+  exists="$(jq -r --arg path "$project_path" '.projects[] | select(.path == $path) | .path' "$REGISTRY_FILE" 2>/dev/null)" || true
+  if [ -n "$exists" ]; then
+    # Update existing entry
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg name "$project_name" --arg path "$project_path" \
+      '(.projects[] | select(.path == $path)) |= {name: $name, path: $path}' \
+      "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+  else
+    # Add new entry
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg name "$project_name" --arg path "$project_path" \
+      '.projects += [{name: $name, path: $path}]' \
+      "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+  fi
+}
+
+# --- Copy core files from ~/.ceoloop/core/ into .claude/ ---
+copy_core_files() {
+  local target_dir="$1"
+  local claude_dir="$target_dir/.claude"
+
+  # Hooks
+  if [ -d "$CEOLOOP_HOME/core/hooks" ]; then
+    mkdir -p "$claude_dir/hooks"
+    cp "$CEOLOOP_HOME/core/hooks/"* "$claude_dir/hooks/" 2>/dev/null || true
+    chmod +x "$claude_dir/hooks/"*.sh 2>/dev/null || true
+  fi
+
+  # Scripts
+  if [ -d "$CEOLOOP_HOME/core/scripts" ]; then
+    mkdir -p "$claude_dir/scripts"
+    cp "$CEOLOOP_HOME/core/scripts/"* "$claude_dir/scripts/" 2>/dev/null || true
+    chmod +x "$claude_dir/scripts/"*.sh 2>/dev/null || true
+  fi
+
+  # Skills
+  if [ -d "$CEOLOOP_HOME/core/skills/boot" ]; then
+    mkdir -p "$claude_dir/skills/boot"
+    cp "$CEOLOOP_HOME/core/skills/boot/SKILL.md" "$claude_dir/skills/boot/SKILL.md" 2>/dev/null || true
+  fi
+}
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+# --- ceoloop version ---
+cmd_version() {
+  if [ -f "$VERSION_FILE" ]; then
+    echo "ceoloop $(cat "$VERSION_FILE" | tr -d '[:space:]')"
+  else
+    err "VERSION file not found at $VERSION_FILE"
+    exit 1
+  fi
+}
+
+# --- ceoloop init ---
+cmd_init() {
+  echo ""
+  echo "  CEOLoop v3 -- Setup"
+  echo ""
+
+  # 1. Check prerequisites
+  info "Checking prerequisites..."
+
+  local missing=""
+
+  local tmux_bin
+  tmux_bin="$(find_tmux)"
+  if [ -z "$tmux_bin" ]; then
+    missing="$missing tmux(brew install tmux)"
+  else
+    ok "tmux: $tmux_bin"
+  fi
+
+  local claude_bin
+  claude_bin="$(find_claude)"
+  if [ -z "$claude_bin" ]; then
+    missing="$missing claude(https://claude.ai/code)"
+  else
+    ok "claude: $claude_bin"
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    ok "jq: $(command -v jq)"
+  else
+    missing="$missing jq(brew install jq)"
+  fi
+
+  if [ -n "$missing" ]; then
+    echo ""
+    err "Missing prerequisites:"
+    for item in $missing; do
+      local name="${item%%(*}"
+      local install="${item#*(}"
+      install="${install%)}"
+      echo "    - $name: install with: $install" >&2
+    done
+    exit 1
+  fi
+
+  # 1b. Detect existing CEOLoop-compatible files (migration warning)
+  if [ -f "$(pwd)/.claude/scripts/telegram-poll.sh" ] || [ -d "$(pwd)/.claude/hooks" ]; then
+    echo ""
+    warn "Existing CEOLoop-compatible files detected."
+    info "  Core files (hooks, scripts, skills/boot) will be overwritten with the latest versions."
+    info "  Your agent definitions, Telegram config, and settings.json will NOT be modified."
+    echo ""
+    info "  If you have a LaunchAgent installed, uninstall it first:"
+    info "    ceoloop uninstall (or: ./start.sh uninstall)"
+    echo ""
+    local confirm=""
+    if [ -t 0 ]; then
+      read -p "  Continue? [y/N]: " confirm < /dev/tty
+    elif [ -e /dev/tty ]; then
+      read -p "  Continue? [y/N]: " confirm < /dev/tty
+    fi
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      info "Aborted."
+      exit 0
+    fi
+  fi
+
+  # 2. Ask: project name
+  local default_name
+  default_name="$(basename "$(pwd)")"
+  echo ""
+  if [ -t 0 ]; then
+    read -p "  Project name [$default_name]: " project_name < /dev/tty
+  elif [ -e /dev/tty ]; then
+    read -p "  Project name [$default_name]: " project_name < /dev/tty
+  else
+    project_name=""
+  fi
+  project_name="${project_name:-$default_name}"
+  # Sanitize: lowercase, replace spaces/special chars with hyphens
+  project_name="$(echo "$project_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed 's/[^a-z0-9-]//g')"
+
+  # 3. Ask: Telegram bot token
+  echo ""
+  info "Telegram Bot Setup"
+  info ""
+  info "1. Open Telegram and message @BotFather"
+  info "2. Send /newbot and follow the prompts"
+  info "3. Copy the bot token (looks like 123456789:AAH...)"
+  echo ""
+
+  local bot_token=""
+  if [ -t 0 ]; then
+    read -p "  Paste your bot token (or Enter to skip): " bot_token < /dev/tty
+  elif [ -e /dev/tty ]; then
+    read -p "  Paste your bot token (or Enter to skip): " bot_token < /dev/tty
+  fi
+
+  if [ -n "$bot_token" ]; then
+    if [[ "$bot_token" != *":"* ]]; then
+      warn "Token doesn't look right (missing ':'). Saving anyway."
+    fi
+  fi
+
+  # 4. Ask: founder chat ID
+  local founder_chat_id=""
+  if [ -n "$bot_token" ]; then
+    echo ""
+    info "To find your Telegram chat ID:"
+    info "1. Send any message to your bot on Telegram"
+    info "2. Visit: https://api.telegram.org/bot${bot_token}/getUpdates"
+    info "3. Look for \"chat\":{\"id\":XXXXXXXX}"
+    echo ""
+    if [ -t 0 ]; then
+      read -p "  Your Telegram chat ID (or Enter to skip): " founder_chat_id < /dev/tty
+    elif [ -e /dev/tty ]; then
+      read -p "  Your Telegram chat ID (or Enter to skip): " founder_chat_id < /dev/tty
+    fi
+  fi
+
+  # 5. Create directory structure
+  echo ""
+  info "Scaffolding .claude/ structure..."
+
+  local claude_dir="$(pwd)/.claude"
+  mkdir -p "$claude_dir"/{telegram,agents,hooks,scripts,skills/boot,logs}
+
+  # ceoloop.json
+  local version
+  version="$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]' || echo "3.0.0")"
+  jq -n \
+    --arg version "$version" \
+    --arg project "$project_name" \
+    --arg founder_chat_id "${founder_chat_id:-}" \
+    '{version: $version, project: $project, founder_chat_id: $founder_chat_id, logs_dir: ".claude/logs"}' \
+    > "$claude_dir/ceoloop.json"
+  ok "created .claude/ceoloop.json"
+
+  # Telegram .env
+  if [ -n "$bot_token" ]; then
+    echo "TELEGRAM_BOT_TOKEN=$bot_token" > "$claude_dir/telegram/.env"
+    chmod 600 "$claude_dir/telegram/.env"
+    ok "saved bot token to .claude/telegram/.env"
+  fi
+
+  # Telegram access.json
+  if [ -n "$founder_chat_id" ]; then
+    jq -n \
+      --arg id "$founder_chat_id" \
+      '{dmPolicy: "allowlist", allowFrom: [$id]}' \
+      > "$claude_dir/telegram/access.json"
+    chmod 600 "$claude_dir/telegram/access.json"
+    ok "saved access policy to .claude/telegram/access.json"
+  else
+    echo '{"dmPolicy":"allowlist","allowFrom":[]}' > "$claude_dir/telegram/access.json"
+    chmod 600 "$claude_dir/telegram/access.json"
+    warn "No chat ID set. Edit .claude/telegram/access.json later."
+  fi
+
+  # settings.json (only if not exists)
+  if [ ! -f "$claude_dir/settings.json" ] && [ -f "$CEOLOOP_HOME/templates/claude-settings/settings.json" ]; then
+    cp "$CEOLOOP_HOME/templates/claude-settings/settings.json" "$claude_dir/settings.json"
+    ok "installed .claude/settings.json"
+  elif [ ! -f "$claude_dir/settings.json" ]; then
+    # Fallback: create a minimal one
+    cat > "$claude_dir/settings.json" << 'SETTINGSEOF'
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf /*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(~/.ssh/*)",
+      "Read(~/.aws/*)",
+      "Read(~/.gnupg/*)",
+      "Write(.claude/agents/*)",
+      "Edit(.claude/agents/*)",
+      "Write(.claude/settings.json)",
+      "Edit(.claude/settings.json)",
+      "Write(.claude/scripts/*)",
+      "Edit(.claude/scripts/*)"
+    ]
+  }
+}
+SETTINGSEOF
+    ok "created .claude/settings.json with safety deny rules"
+  fi
+
+  # 6. Copy core files from ~/.ceoloop/core/
+  copy_core_files "$(pwd)"
+  ok "copied core files (hooks, scripts, skills)"
+
+  # 7. Register project
+  register_project "$project_name" "$(pwd)"
+  ok "registered project in ~/.ceoloop/registry.json"
+
+  # 8. Update .gitignore
+  local gitignore="$(pwd)/.gitignore"
+  local gitignore_block="# CEOLoop (runtime state)
+.claude/telegram/
+.claude/logs/
+.claude/telegram/.env"
+
+  if [ -f "$gitignore" ]; then
+    if ! grep -q "CEOLoop" "$gitignore" 2>/dev/null; then
+      echo "" >> "$gitignore"
+      echo "$gitignore_block" >> "$gitignore"
+      ok "updated .gitignore"
+    fi
+  else
+    echo "$gitignore_block" > "$gitignore"
+    ok "created .gitignore"
+  fi
+
+  # 9. Success
+  echo ""
+  echo "  CEOLoop initialized for '$project_name'."
+  echo ""
+  echo "  Next steps:"
+  echo "    ceoloop start          # Launch the CEO agent"
+  echo "    tmux attach -t ${project_name}-ceo  # Watch the session"
+  echo ""
+  if [ -z "$bot_token" ]; then
+    echo "  You skipped Telegram setup. To configure later:"
+    echo "    1. Create a bot via @BotFather on Telegram"
+    echo "    2. Save the token to .claude/telegram/.env:"
+    echo "       echo 'TELEGRAM_BOT_TOKEN=your_token' > .claude/telegram/.env"
+    echo "    3. Add your chat ID to .claude/telegram/access.json"
+    echo ""
+  fi
+}
+
+# --- ceoloop start ---
+cmd_start() {
+  load_project_config
+  local project_dir="$(pwd)"
+
+  local tmux_bin
+  tmux_bin="$(find_tmux)"
+  [ -z "$tmux_bin" ] && err "tmux not found. Install with: brew install tmux" && exit 1
+
+  local claude_bin
+  claude_bin="$(find_claude)"
+  [ -z "$claude_bin" ] && err "claude not found. Install from https://claude.ai/code" && exit 1
+
+  echo ""
+  echo "  Starting CEOLoop for '$PROJECT_NAME'..."
+  echo ""
+
+  # Step 1: Clean up stale sessions
+  info "Step 1/7: Cleaning up stale sessions..."
+
+  # Kill any existing session with our name
+  $tmux_bin kill-session -t "$SESSION" 2>/dev/null || true
+
+  # Kill old-architecture sessions that use plugin:telegram (prevent 409 conflicts)
+  for sid in $($tmux_bin list-sessions -F '#{session_name}' 2>/dev/null || true); do
+    if $tmux_bin list-panes -t "$sid" -F '#{pane_start_command}' 2>/dev/null | grep -q 'plugin:telegram'; then
+      info "  killing stale session '$sid' (has Telegram channel consumer)"
+      $tmux_bin kill-session -t "$sid" 2>/dev/null || true
+    fi
+  done
+
+  # Kill orphan processes from old architecture
+  pkill -f 'claude.*plugin:telegram' 2>/dev/null || true
+  pkill -f 'bun.*telegram' 2>/dev/null || true
+
+  # Kill orphan telegram-daemon processes for THIS project
+  pkill -f "telegram-daemon.sh.*${PROJECT_NAME}" 2>/dev/null || true
+
+  # Brief pause to release polling locks
+  sleep 2
+  ok "stale sessions cleaned"
+
+  # Step 2: Check Chrome CDP (non-fatal)
+  info "Step 2/7: Checking Chrome CDP..."
+  if curl -s --max-time 3 http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+    ok "Chrome CDP available at localhost:9222"
+  else
+    warn "Chrome CDP not running (non-fatal). Some browser tasks will be unavailable."
+  fi
+
+  # Step 3: Check Telegram bot API
+  info "Step 3/7: Checking Telegram bot API..."
+  local env_file="$project_dir/.claude/telegram/.env"
+  if [ -f "$env_file" ]; then
+    local token=""
+    while IFS='=' read -r key value; do
+      [ "$key" = "TELEGRAM_BOT_TOKEN" ] && token="$value"
+    done < "$env_file"
+    if [ -n "$token" ]; then
+      local bot_check
+      bot_check="$(curl -s --max-time 5 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null)" || bot_check=""
+      local bot_ok
+      bot_ok="$(echo "$bot_check" | jq -r '.ok // false' 2>/dev/null)" || bot_ok="false"
+      if [ "$bot_ok" = "true" ]; then
+        local bot_username
+        bot_username="$(echo "$bot_check" | jq -r '.result.username // "unknown"' 2>/dev/null)"
+        ok "Telegram bot online: @$bot_username"
+      else
+        warn "Telegram bot API unreachable. Check token in .claude/telegram/.env"
+      fi
+    else
+      warn "No TELEGRAM_BOT_TOKEN in .claude/telegram/.env"
+    fi
+  else
+    warn "No .claude/telegram/.env found. Telegram disabled."
+  fi
+
+  # Step 4: Prepare logs directory
+  info "Step 4/7: Preparing logs directory..."
+  mkdir -p "$project_dir/$LOGS_DIR"
+  ok "logs directory ready at $LOGS_DIR"
+
+  # Step 5: Send boot notification via Telegram
+  info "Step 5/7: Sending boot notification..."
+  local send_script="$project_dir/.claude/scripts/telegram-send.sh"
+  if [ -x "$send_script" ] && [ -n "$FOUNDER_CHAT_ID" ] && [ "$FOUNDER_CHAT_ID" != "null" ] && [ "$FOUNDER_CHAT_ID" != "" ]; then
+    bash "$send_script" "$FOUNDER_CHAT_ID" "CEOLoop starting for $PROJECT_NAME..." 2>/dev/null && ok "boot notification sent" || warn "failed to send boot notification"
+  else
+    warn "skipping boot notification (no send script or chat ID)"
+  fi
+
+  # Step 6: Launch Telegram daemon in tmux window 1
+  info "Step 6/7: Launching Telegram daemon..."
+  local agent_path
+  agent_path="$(build_agent_path)"
+  local daemon_script="$project_dir/.claude/scripts/telegram-daemon.sh"
+
+  # Create the tmux session with the daemon in window 0
+  if [ -x "$daemon_script" ]; then
+    $tmux_bin new-session -d -s "$SESSION" -n daemon \
+      "export PATH=\"$agent_path\" && cd \"$project_dir\" && bash \"$daemon_script\""
+    ok "Telegram daemon running in tmux window 'daemon'"
+  else
+    # No daemon script — create session with a placeholder
+    $tmux_bin new-session -d -s "$SESSION" -n daemon \
+      "echo 'No telegram-daemon.sh found. Telegram polling disabled.' && sleep infinity"
+    warn "No telegram-daemon.sh found. Daemon window is a placeholder."
+  fi
+
+  # Step 7: Launch CEO in tmux window 2
+  info "Step 7/7: Launching CEO agent..."
+
+  # Wait briefly for tmux session to stabilize
+  sleep 1
+
+  $tmux_bin new-window -t "$SESSION" -n ceo \
+    "export PATH=\"$agent_path\" && cd \"$project_dir\" && $claude_bin --dangerously-skip-permissions --permission-mode bypassPermissions --verbose --debug-file \"$DEBUG_LOG\" '/boot'"
+
+  # Wait for Claude to initialize
+  sleep 2
+
+  ok "CEO agent launched"
+  echo ""
+  echo "  CEOLoop is running."
+  echo ""
+  echo "  Session:  $SESSION"
+  echo "  Debug:    $DEBUG_LOG"
+  echo "  Attach:   $tmux_bin attach -t $SESSION"
+  echo ""
+}
+
+# --- ceoloop stop ---
+cmd_stop() {
+  load_project_config
+
+  local tmux_bin
+  tmux_bin="$(find_tmux)"
+  [ -z "$tmux_bin" ] && err "tmux not found" && exit 1
+
+  echo ""
+  info "Stopping CEOLoop for '$PROJECT_NAME'..."
+
+  # Kill old-architecture sessions with plugin:telegram
+  for sid in $($tmux_bin list-sessions -F '#{session_name}' 2>/dev/null || true); do
+    if $tmux_bin list-panes -t "$sid" -F '#{pane_start_command}' 2>/dev/null | grep -q 'plugin:telegram'; then
+      info "  killing stale session '$sid' (old architecture)"
+      $tmux_bin kill-session -t "$sid" 2>/dev/null || true
+    fi
+  done
+
+  # Kill our tmux session
+  if $tmux_bin has-session -t "$SESSION" 2>/dev/null; then
+    $tmux_bin kill-session -t "$SESSION" 2>/dev/null || true
+    ok "killed tmux session '$SESSION'"
+  else
+    info "session '$SESSION' was not running"
+  fi
+
+  # Kill orphan processes
+  pkill -f "claude.*plugin:telegram" 2>/dev/null || true
+  pkill -f "bun.*telegram" 2>/dev/null || true
+  pkill -f "telegram-daemon.sh" 2>/dev/null || true
+
+  # Clean PID file
+  local pid_file="$(pwd)/.claude/telegram/daemon.pid"
+  rm -f "$pid_file" 2>/dev/null || true
+
+  # Brief pause for cleanup
+  sleep 2
+  ok "stopped"
+  echo ""
+}
+
+# --- ceoloop status ---
+cmd_status() {
+  load_project_config
+
+  local tmux_bin
+  tmux_bin="$(find_tmux)"
+  [ -z "$tmux_bin" ] && err "tmux not found" && exit 1
+
+  echo ""
+  echo "  CEOLoop Status: $PROJECT_NAME"
+  echo "  ──────────────────────────────"
+
+  # tmux session
+  if $tmux_bin has-session -t "$SESSION" 2>/dev/null; then
+    ok "tmux session '$SESSION' is running"
+    # List windows
+    $tmux_bin list-windows -t "$SESSION" -F '    #{window_index}: #{window_name}' 2>/dev/null || true
+  else
+    warn "tmux session '$SESSION' is NOT running"
+  fi
+
+  # Daemon PID
+  local pid_file="$(pwd)/.claude/telegram/daemon.pid"
+  if [ -f "$pid_file" ]; then
+    local daemon_pid
+    daemon_pid="$(cat "$pid_file")"
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+      ok "Telegram daemon running (PID $daemon_pid)"
+    else
+      warn "Telegram daemon PID file exists but process is dead"
+    fi
+  else
+    info "  No Telegram daemon PID file"
+  fi
+
+  # Inbox message count
+  local inbox_dir="$(pwd)/.claude/telegram/inbox"
+  if [ -d "$inbox_dir" ]; then
+    local msg_count=0
+    for f in "$inbox_dir"/*.json; do
+      [ -f "$f" ] || continue
+      msg_count=$((msg_count + 1))
+    done
+    info "  Inbox: $msg_count unread message(s)"
+  fi
+
+  # Chrome CDP
+  if curl -s --max-time 3 http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+    ok "Chrome CDP available"
+  else
+    info "  Chrome CDP not running"
+  fi
+
+  # Telegram bot API
+  local health_script="$(pwd)/.claude/scripts/telegram-health.sh"
+  if [ -x "$health_script" ]; then
+    local health_status
+    health_status="$(bash "$health_script" 2>/dev/null)" || health_status="unknown"
+    info "  Telegram health: $health_status"
+  fi
+
+  # LaunchAgent
+  local plist="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+  if [ -f "$plist" ]; then
+    if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+      ok "LaunchAgent installed and loaded"
+    else
+      warn "LaunchAgent installed but not loaded"
+    fi
+  else
+    info "  LaunchAgent not installed"
+  fi
+
+  echo ""
+}
+
+# --- ceoloop restart ---
+cmd_restart() {
+  cmd_stop
+  cmd_start
+}
+
+# --- ceoloop install ---
+cmd_install() {
+  load_project_config
+  local project_dir="$(pwd)"
+  local plist_path="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+  local ceoloop_bin="$CEOLOOP_HOME/bin/ceoloop"
+  local agent_path
+  agent_path="$(build_agent_path)"
+
+  echo ""
+  info "Installing LaunchAgent for '$PROJECT_NAME'..."
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+
+  cat > "$plist_path" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd "${project_dir}" &amp;&amp; "${ceoloop_bin}" start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${agent_path}</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${project_dir}/.claude/logs/launchd-ceo.log</string>
+    <key>StandardErrorPath</key>
+    <string>${project_dir}/.claude/logs/launchd-ceo.err</string>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+PLISTEOF
+
+  launchctl load "$plist_path" 2>/dev/null || true
+  ok "LaunchAgent installed: $plist_path"
+  info "  CEO will start on login + daily at 4:00 AM"
+  echo ""
+}
+
+# --- ceoloop uninstall ---
+cmd_uninstall() {
+  load_project_config
+  local plist_path="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+  echo ""
+  info "Uninstalling LaunchAgent for '$PROJECT_NAME'..."
+
+  if [ -f "$plist_path" ]; then
+    launchctl unload "$plist_path" 2>/dev/null || true
+    rm -f "$plist_path"
+    ok "LaunchAgent removed"
+  else
+    info "LaunchAgent was not installed"
+  fi
+  echo ""
+}
+
+# --- ceoloop update ---
+cmd_update() {
+  local update_all=false
+  [ "${1:-}" = "--all" ] && update_all=true
+
+  echo ""
+  info "Updating CEOLoop..."
+
+  # Step 1: git pull ~/.ceoloop
+  info "Pulling latest from git..."
+  (cd "$CEOLOOP_HOME" && git pull --quiet 2>/dev/null) || {
+    err "Failed to git pull $CEOLOOP_HOME"
+    exit 1
+  }
+
+  local new_version
+  new_version="$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]')"
+  ok "updated to v$new_version"
+
+  if [ "$update_all" = true ]; then
+    # Update all registered projects
+    if [ ! -f "$REGISTRY_FILE" ]; then
+      warn "No registry.json found. No projects to update."
+      echo ""
+      return
+    fi
+
+    local project_count
+    project_count="$(jq '.projects | length' "$REGISTRY_FILE" 2>/dev/null)" || project_count=0
+
+    if [ "$project_count" -eq 0 ]; then
+      warn "No projects registered."
+      echo ""
+      return
+    fi
+
+    info "Updating $project_count registered project(s)..."
+    echo ""
+
+    for i in $(seq 0 $((project_count - 1))); do
+      local p_name p_path
+      p_name="$(jq -r ".projects[$i].name" "$REGISTRY_FILE")"
+      p_path="$(jq -r ".projects[$i].path" "$REGISTRY_FILE")"
+
+      if [ ! -d "$p_path/.claude" ]; then
+        warn "  $p_name ($p_path) -- .claude/ not found, skipping"
+        continue
+      fi
+
+      info "  Updating $p_name..."
+      copy_core_files "$p_path"
+
+      # Update version in ceoloop.json
+      local config_file="$p_path/.claude/ceoloop.json"
+      if [ -f "$config_file" ]; then
+        local tmp
+        tmp="$(mktemp)"
+        jq --arg v "$new_version" '.version = $v' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
+      fi
+      ok "  $p_name updated to v$new_version"
+    done
+  else
+    # Update current project only
+    local project_dir="$(pwd)"
+    if [ ! -f "$project_dir/.claude/ceoloop.json" ]; then
+      err "No .claude/ceoloop.json in current directory. Run from a project or use --all."
+      exit 1
+    fi
+
+    local old_version
+    old_version="$(jq -r '.version' "$project_dir/.claude/ceoloop.json" 2>/dev/null)" || old_version="unknown"
+
+    copy_core_files "$project_dir"
+
+    # Update version in ceoloop.json
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg v "$new_version" '.version = $v' "$project_dir/.claude/ceoloop.json" > "$tmp" && mv "$tmp" "$project_dir/.claude/ceoloop.json"
+
+    ok "project updated: v$old_version -> v$new_version"
+    info "Core files re-copied: hooks, scripts, skills/boot"
+  fi
+
+  echo ""
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+COMMAND="${1:-}"
+
+case "$COMMAND" in
+  init)      cmd_init ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  status)    cmd_status ;;
+  restart)   cmd_restart ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  update)    cmd_update "${2:-}" ;;
+  version)   cmd_version ;;
+  -v|--version) cmd_version ;;
+  "")
+    echo ""
+    echo "  CEOLoop -- Autonomous AI agent teams for any project"
+    echo ""
+    echo "  Usage: ceoloop <command>"
+    echo ""
+    echo "  Commands:"
+    echo "    init        Set up CEOLoop in the current project"
+    echo "    start       Launch tmux session (daemon + CEO)"
+    echo "    stop        Stop tmux session + orphan processes"
+    echo "    status      Check what's running"
+    echo "    restart     Stop + start"
+    echo "    install     Install macOS LaunchAgent for auto-start"
+    echo "    uninstall   Remove LaunchAgent"
+    echo "    update      Pull latest + re-copy core files"
+    echo "    update --all  Update all registered projects"
+    echo "    version     Print version"
+    echo ""
+    ;;
+  *)
+    err "Unknown command: $COMMAND"
+    echo "  Run 'ceoloop' for usage."
+    exit 1
+    ;;
+esac

@@ -1,0 +1,5 @@
+# CEOLoop (runtime state)
+.claude/telegram/
+.claude/logs/
+.claude/teams/
+.claude/worktrees/

@@ -1,0 +1,7 @@
+.env
+*.env
+.agents/inbox/*.json
+.agents/telegram-offset
+.claude/telegram/
+.DS_Store
+/tmp/
