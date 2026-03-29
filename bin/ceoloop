@@ -348,6 +348,12 @@ cmd_init() {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "defaultMode": "bypassPermissions",
+    "allow": [
+      "Bash(cat .claude/telegram/*)",
+      "Read(.claude/telegram/*)",
+      "Write(.claude/telegram/*)",
+      "Edit(.claude/telegram/*)"
+    ],
     "deny": [
       "Bash(rm -rf /)",
       "Bash(rm -rf ~)",

@@ -24,7 +24,7 @@ PROCESSED_DIR="$STATE_DIR/processed"
 mkdir -p "$INBOX_DIR" "$PROCESSED_DIR"
 
 MODE="${1:-read}"
-OFFSET_FILE="$STATE_DIR/telegram-offset"
+OFFSET_FILE="$PROJECT_DIR/.claude/telegram-offset"
 PID_FILE="$STATE_DIR/daemon.pid"
 DAEMON_SCRIPT="$SCRIPT_DIR/telegram-daemon.sh"
 DAEMON_LOG="$STATE_DIR/daemon.log"
