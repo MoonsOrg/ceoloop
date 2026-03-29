@@ -47,18 +47,42 @@ echo "[telegram-daemon] Press Ctrl+C to stop"
 
 CONSECUTIVE_ERRORS=0
 MAX_ERRORS=10
+LOG_FILE="$STATE_DIR/daemon.log"
+
+# Rotate log if over 1000 lines
+rotate_log() {
+  if [ -f "$LOG_FILE" ]; then
+    local line_count
+    line_count=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$line_count" -gt 1000 ]; then
+      local tmp
+      tmp=$(mktemp)
+      tail -n 500 "$LOG_FILE" > "$tmp"
+      mv "$tmp" "$LOG_FILE"
+    fi
+  fi
+}
+
+log_msg() {
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" >> "$LOG_FILE"
+}
+
+log_msg "Daemon started (PID $$)"
 
 while true; do
-  if bash "$POLL_SCRIPT" 2>/dev/null; then
+  if POLL_OUTPUT=$(bash "$POLL_SCRIPT" 2>&1); then
     CONSECUTIVE_ERRORS=0
   else
     CONSECUTIVE_ERRORS=$((CONSECUTIVE_ERRORS + 1))
+    log_msg "Poll error ($CONSECUTIVE_ERRORS/$MAX_ERRORS): $POLL_OUTPUT"
     echo "[telegram-daemon] Poll error ($CONSECUTIVE_ERRORS/$MAX_ERRORS)" >&2
     if [ "$CONSECUTIVE_ERRORS" -ge "$MAX_ERRORS" ]; then
+      log_msg "Too many consecutive errors. Backing off to 30s."
       echo "[telegram-daemon] Too many consecutive errors. Backing off to 30s." >&2
       sleep 30
       CONSECUTIVE_ERRORS=0
     fi
   fi
+  rotate_log
   sleep "$POLL_INTERVAL"
 done
