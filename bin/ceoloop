@@ -254,19 +254,38 @@ cmd_init() {
     fi
   fi
 
-  # 4. Ask: founder chat ID
+  # 4. Auto-detect founder chat ID
   local founder_chat_id=""
   if [ -n "$bot_token" ]; then
     echo ""
-    info "To find your Telegram chat ID:"
-    info "1. Send any message to your bot on Telegram"
-    info "2. Visit: https://api.telegram.org/bot${bot_token}/getUpdates"
-    info "3. Look for \"chat\":{\"id\":XXXXXXXX}"
+    info "Now send any message to your bot on Telegram (e.g. say \"hi\")"
+    info "Waiting for your message..."
     echo ""
-    if [ -t 0 ]; then
-      read -p "  Your Telegram chat ID (or Enter to skip): " founder_chat_id < /dev/tty
-    elif [ -e /dev/tty ]; then
-      read -p "  Your Telegram chat ID (or Enter to skip): " founder_chat_id < /dev/tty
+
+    local attempts=0
+    local max_attempts=30
+    while [ $attempts -lt $max_attempts ]; do
+      local response
+      response="$(curl -s "https://api.telegram.org/bot${bot_token}/getUpdates?limit=1&offset=-1" 2>/dev/null)"
+      local detected_id
+      detected_id="$(echo "$response" | jq -r '.result[-1].message.chat.id // empty' 2>/dev/null)"
+      if [ -n "$detected_id" ]; then
+        local detected_name
+        detected_name="$(echo "$response" | jq -r '.result[-1].message.chat.first_name // "unknown"' 2>/dev/null)"
+        ok "Detected! Chat ID: $detected_id ($detected_name)"
+        founder_chat_id="$detected_id"
+        break
+      fi
+      sleep 2
+      attempts=$((attempts + 1))
+      # Show a dot every 5 attempts so user knows it's still waiting
+      if [ $((attempts % 5)) -eq 0 ]; then
+        printf "  still waiting...\n"
+      fi
+    done
+
+    if [ -z "$founder_chat_id" ]; then
+      warn "Timed out waiting for a message. You can set founder_chat_id manually in .claude/ceoloop.json later."
     fi
   fi
 
